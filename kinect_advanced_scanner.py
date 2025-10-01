@@ -3,203 +3,374 @@ import os
 import time
 from datetime import datetime
 from pathlib import Path
+import threading
+from collections import namedtuple
+import argparse
+
 import numpy as np
 import cv2
 import freenect
 import open3d as o3d
 import trimesh
-from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QPushButton, 
-                              QVBoxLayout, QHBoxLayout, QProgressBar, 
-                              QSpinBox, QComboBox, QGroupBox, QCheckBox,
-                              QMessageBox, QFileDialog, QTextEdit)
+
+# Optional tensor/GPU backend
+try:
+    import open3d.core as o3c
+    import open3d.t as o3t
+    O3D_T_AVAILABLE = True
+except Exception:
+    O3D_T_AVAILABLE = False
+
+# Optional torch (for future AI integration)
+try:
+    import torch  # noqa: F401
+    TORCH_AVAILABLE = True
+except Exception:
+    TORCH_AVAILABLE = False
+
+# Optional system info (auto quality)
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except Exception:
+    PSUTIL_AVAILABLE = False
+
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
+    QProgressBar, QSpinBox, QComboBox, QGroupBox, QCheckBox, QMessageBox,
+    QFileDialog, QTextEdit
+)
 from PyQt5.QtCore import QTimer, Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QImage, QPixmap, QFont
+from PyQt5.QtGui import QImage, QPixmap
 
 BASE_DIR = "KinectScans"
 os.makedirs(BASE_DIR, exist_ok=True)
 
+FramePack = namedtuple("FramePack", ["rgbd_frames", "poses"])
+
+
 class ReconstructionThread(QThread):
-    """Arka planda mesh oluşturma için thread"""
+    """Arka planda mesh oluşturma ve birleştirme."""
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(object, bool)
-    
-    def __init__(self, rgbd_frames, intrinsic, quality_level, use_icp):
+
+    def __init__(self, rgbd_frames, intrinsic, quality_level, use_icp,
+                 use_gpu=False, use_texture=True, ai_model='Kapalı', enable_slam=True):
         super().__init__()
-        self.rgbd_frames = rgbd_frames
+        # Çoklu tarama listesi normalize
+        self.input_scans = rgbd_frames if isinstance(rgbd_frames[0], list) else [rgbd_frames]
         self.intrinsic = intrinsic
         self.quality_level = quality_level
         self.use_icp = use_icp
-        
+        self.use_gpu = use_gpu and O3D_T_AVAILABLE
+        self.use_texture = use_texture
+        self.ai_model = ai_model
+        self.enable_slam = enable_slam
+
     def run(self):
         try:
             self.progress.emit(10, "Pose estimation başlıyor...")
-            poses = self.compute_poses()
-            
-            self.progress.emit(40, "TSDF integration yapılıyor...")
-            mesh = self.tsdf_integration(poses)
-            
-            self.progress.emit(70, "Mesh temizleniyor...")
+            scan_packs = self.compute_poses_multi()
+
+            if self.enable_slam:
+                self.progress.emit(25, "Loop closure ve pose graph optimizasyonu...")
+                scan_packs = [self.pose_graph_optimize(p) for p in scan_packs]
+
+            self.progress.emit(35, "Global hizalama ve paket birleştirme...")
+            merged_pack = self.global_merge(scan_packs)
+
+            self.progress.emit(50, "TSDF integration yapılıyor...")
+            mesh = self.tsdf_integration(merged_pack)
+
+            self.progress.emit(68, "Mesh temizleniyor ve düzgünleştiriliyor...")
             mesh = self.clean_mesh(mesh)
-            
-            self.progress.emit(90, "AI iyileştirme uygulanıyor...")
-            mesh = self.ai_enhance(mesh)
-            
-            self.progress.emit(100, "Tamamlandı!")
+
+            if self.use_texture:
+                self.progress.emit(78, "Color map optimizasyonu ile texture mapping...")
+                mesh = self.texture_map(mesh, merged_pack)
+
+            self.progress.emit(86, "AI tamamlama uygulanıyor...")
+            mesh = self.ai_complete(mesh)
+
+            self.progress.emit(92, "Ölçüm ve analiz hesaplanıyor...")
+            size_text = self.measure_and_log(mesh)
+
+            self.progress.emit(96, "Son rötuşlar...")
+            mesh.compute_vertex_normals()
+
+            self.progress.emit(100, f"Tamamlandı! {size_text}")
             self.finished.emit(mesh, True)
-            
         except Exception as e:
             self.progress.emit(0, f"Hata: {str(e)}")
             self.finished.emit(None, False)
-    
-    def compute_poses(self):
-        """Gelişmiş pose estimation (Odometry + ICP)"""
-        pose = np.eye(4)
-        poses = [pose.copy()]
-        
-        success_count = 0
-        total_drift = 0.0
-        
-        for i in range(1, len(self.rgbd_frames)):
-            # RGB-D Odometry
-            success_odo, odo_trans, info = o3d.pipelines.odometry.compute_rgbd_odometry(
-                self.rgbd_frames[i-1], 
-                self.rgbd_frames[i], 
-                self.intrinsic,
-                np.eye(4),
-                o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm()
+
+    def compute_poses_multi(self):
+        packs = []
+        for s_idx, frames in enumerate(self.input_scans):
+            pose = np.eye(4)
+            poses = [pose.copy()]
+            success_count = 0
+            total_drift = 0.0
+            for i in range(1, len(frames)):
+                success_odo, odo_trans, _ = o3d.pipelines.odometry.compute_rgbd_odometry(
+                    frames[i - 1], frames[i], self.intrinsic, np.eye(4),
+                    o3d.pipelines.odometry.RGBDOdometryJacobianFromHybridTerm()
+                )
+                if success_odo:
+                    if self.use_icp:
+                        src = o3d.geometry.PointCloud.create_from_rgbd_image(frames[i], self.intrinsic)
+                        tgt = o3d.geometry.PointCloud.create_from_rgbd_image(frames[i - 1], self.intrinsic)
+                        icp_result = o3d.pipelines.registration.registration_icp(
+                            src, tgt, 0.05, odo_trans,
+                            o3d.pipelines.registration.TransformationEstimationPointToPoint()
+                        )
+                        if icp_result.fitness > 0.3:
+                            odo_trans = icp_result.transformation
+                    translation = np.linalg.norm(odo_trans[:3, 3])
+                    if translation < 0.5:
+                        pose = pose @ odo_trans
+                        success_count += 1
+                        total_drift += translation
+                poses.append(pose.copy())
+                if i % 10 == 0:
+                    progress = int(10 + (i / len(frames)) * 15)
+                    avg_drift = total_drift / max(success_count, 1)
+                    self.progress.emit(progress, f"Paket {s_idx + 1}: Pose {i}/{len(frames)} - Başarı: {success_count}/{i} - Drift: {avg_drift:.4f}m")
+            packs.append(FramePack(frames, poses))
+        return packs
+
+    def pose_graph_optimize(self, pack: FramePack):
+        """Basit loop-closure ile pose graph optimizasyonu."""
+        frames, poses = pack.rgbd_frames, pack.poses
+        if len(frames) < 10:
+            return pack
+        pg = o3d.pipelines.registration.PoseGraph()
+        pg.nodes.append(o3d.pipelines.registration.PoseGraphNode(np.eye(4)))
+
+        # Ardışık kenarlar
+        for i in range(1, len(frames)):
+            transformation = np.linalg.inv(poses[i - 1]) @ poses[i]
+            info = np.eye(6)
+            pg.edges.append(
+                o3d.pipelines.registration.PoseGraphEdge(i - 1, i, transformation, info, uncertain=False)
             )
-            
-            if success_odo:
-                # ICP ile refine et (eğer aktifse)
-                if self.use_icp:
-                    source_pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
-                        self.rgbd_frames[i], self.intrinsic
+
+        # Basit loop closure: her 30 frame'de bir öncekilerle eşle
+        step = max(30, len(frames) // 10)
+        for i in range(0, len(frames), step):
+            for j in range(i + step, len(frames), step):
+                src = o3d.geometry.PointCloud.create_from_rgbd_image(frames[i], self.intrinsic)
+                tgt = o3d.geometry.PointCloud.create_from_rgbd_image(frames[j], self.intrinsic)
+                src.estimate_normals()
+                tgt.estimate_normals()
+                result = o3d.pipelines.registration.registration_icp(
+                    src, tgt, 0.05, np.eye(4),
+                    o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                    o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=30)
+                )
+                if result.fitness > 0.5:
+                    pg.edges.append(
+                        o3d.pipelines.registration.PoseGraphEdge(i, j, result.transformation, np.eye(6), uncertain=True)
                     )
-                    target_pcd = o3d.geometry.PointCloud.create_from_rgbd_image(
-                        self.rgbd_frames[i-1], self.intrinsic
-                    )
-                    
-                    icp_result = o3d.pipelines.registration.registration_icp(
-                        source_pcd, target_pcd, 0.05, odo_trans,
-                        o3d.pipelines.registration.TransformationEstimationPointToPoint()
-                    )
-                    
-                    if icp_result.fitness > 0.3:  # ICP başarılıysa
-                        odo_trans = icp_result.transformation
-                
-                # Drift kontrolü
-                translation = np.linalg.norm(odo_trans[:3, 3])
-                if translation < 0.5:  # Aşırı büyük hareket reddedilir
-                    pose = pose @ odo_trans
-                    success_count += 1
-                    total_drift += translation
-                else:
-                    print(f"[WARN] Frame {i}: Aşırı büyük hareket tespit edildi ({translation:.3f}m)")
-            
-            poses.append(pose.copy())
-            
-            if i % 10 == 0:
-                progress = int(10 + (i / len(self.rgbd_frames)) * 30)
-                avg_drift = total_drift / max(success_count, 1)
-                self.progress.emit(progress, 
-                    f"Pose {i}/{len(self.rgbd_frames)} - Başarı: {success_count}/{i} - Drift: {avg_drift:.4f}m")
-        
-        print(f"[INFO] Toplam {success_count}/{len(self.rgbd_frames)-1} pose başarılı")
-        return poses
-    
-    def tsdf_integration(self, poses):
-        """Optimized TSDF integration"""
-        # Kalite seviyesine göre parametreler
+
+        opt_option = o3d.pipelines.registration.GlobalOptimizationOption(
+            max_correspondence_distance=0.05,
+            edge_prune_threshold=0.25,
+            reference_node=0
+        )
+        o3d.pipelines.registration.global_optimization(
+            pg,
+            o3d.pipelines.registration.GlobalOptimizationLevenbergMarquardt(),
+            o3d.pipelines.registration.GlobalOptimizationConvergenceCriteria(),
+            opt_option
+        )
+
+        # Optimizasyon sonrası pozları yeniden oluştur
+        new_poses = [np.eye(4)]
+        for i in range(1, len(frames)):
+            new_poses.append(new_poses[i - 1] @ pg.edges[i - 1].transformation)
+        return FramePack(frames, new_poses)
+
+    def global_merge(self, scan_packs):
+        if len(scan_packs) == 1:
+            return scan_packs[0]
+
+        def pcd_from_pack(pack):
+            pcd = o3d.geometry.PointCloud()
+            step = max(1, len(pack.rgbd_frames) // 30)
+            for rgbd in pack.rgbd_frames[::step]:
+                p = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, self.intrinsic)
+                pcd += p.voxel_down_sample(0.01)
+            return pcd
+
+        base = scan_packs[0]
+        base_pcd = pcd_from_pack(base)
+        base_pcd.estimate_normals()
+        merged_frames = base.rgbd_frames.copy()
+        merged_poses = base.poses.copy()
+
+        for k in range(1, len(scan_packs)):
+            cur = scan_packs[k]
+            cur_pcd = pcd_from_pack(cur)
+            cur_pcd.estimate_normals()
+
+            radius = 0.05
+            base_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+                base_pcd, o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=100))
+            cur_fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+                cur_pcd, o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=100))
+
+            ransac = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+                cur_pcd, base_pcd, cur_fpfh, base_fpfh, True, 0.05,
+                o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+                4,
+                [o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+                 o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(0.05)],
+                o3d.pipelines.registration.RANSACConvergenceCriteria(100000, 1000))
+            T_kb = ransac.transformation
+
+            icp = o3d.pipelines.registration.registration_icp(
+                cur_pcd, base_pcd, 0.03, T_kb,
+                o3d.pipelines.registration.TransformationEstimationPointToPlane())
+            T_kb = icp.transformation
+
+            for i, pose in enumerate(cur.poses):
+                merged_poses.append(T_kb @ pose)
+                merged_frames.append(cur.rgbd_frames[i])
+
+            self.progress.emit(45, f"Paket {k + 1} global hizalama tamamlandı.")
+        return FramePack(merged_frames, merged_poses)
+
+    def tsdf_integration(self, merged_pack):
         quality_params = {
             'Hızlı': {'voxel': 0.008, 'sdf_trunc': 0.04},
             'Orta': {'voxel': 0.004, 'sdf_trunc': 0.02},
             'Yüksek': {'voxel': 0.002, 'sdf_trunc': 0.01}
         }
-        
         params = quality_params.get(self.quality_level, quality_params['Orta'])
-        
+
+        if self.use_gpu:
+            try:
+                voxel_size = params['voxel']
+                sdf_trunc = params['sdf_trunc']
+                tsdf = o3t.geometry.TSDFVoxelGrid(
+                    voxel_size=voxel_size, sdf_trunc=sdf_trunc,
+                    block_resolution=16, block_count=10000,
+                    device=o3c.cuda.Device(0)
+                )
+                fx, fy = self.intrinsic.get_focal_length()
+                cx, cy = self.intrinsic.get_principal_point()
+                K = o3c.Tensor([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=o3c.Dtype.Float32)
+                for idx, (rgbd, T) in enumerate(zip(merged_pack.rgbd_frames, merged_pack.poses)):
+                    color = o3t.geometry.Image.from_legacy(rgbd.color)
+                    depth = o3t.geometry.Image.from_legacy(rgbd.depth)
+                    extr = o3c.Tensor(np.linalg.inv(T), dtype=o3c.Dtype.Float32)
+                    tsdf.integrate(depth, color, K, extr)
+                    if idx % 10 == 0:
+                        progress = int(50 + (idx / len(merged_pack.rgbd_frames)) * 18)
+                        self.progress.emit(progress, f"GPU Integration {idx}/{len(merged_pack.rgbd_frames)}")
+                mesh = tsdf.extract_triangle_mesh().to_legacy()
+                mesh.compute_vertex_normals()
+                return mesh
+            except Exception as e:
+                self.progress.emit(52, f"GPU TSDF başarısız, CPU moduna düşüldü: {e}")
+
         volume = o3d.pipelines.integration.ScalableTSDFVolume(
             voxel_length=params['voxel'],
             sdf_trunc=params['sdf_trunc'],
             color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
         )
-        
-        for idx, (rgbd, T) in enumerate(zip(self.rgbd_frames, poses)):
+        for idx, (rgbd, T) in enumerate(zip(merged_pack.rgbd_frames, merged_pack.poses)):
             volume.integrate(rgbd, self.intrinsic, np.linalg.inv(T))
-            
             if idx % 10 == 0:
-                progress = int(40 + (idx / len(self.rgbd_frames)) * 30)
-                self.progress.emit(progress, f"Integration {idx}/{len(self.rgbd_frames)}")
-        
+                progress = int(50 + (idx / len(merged_pack.rgbd_frames)) * 18)
+                self.progress.emit(progress, f"Integration {idx}/{len(merged_pack.rgbd_frames)}")
+
         mesh = volume.extract_triangle_mesh()
         mesh.compute_vertex_normals()
         return mesh
-    
+
     def clean_mesh(self, mesh):
-        """Mesh temizleme ve filtreleme"""
-        # Statistical outlier removal
-        mesh_clean, _ = mesh.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-        
-        # Küçük bağlantısız parçaları kaldır
+        mesh_clean = mesh.filter_smooth_laplacian(number_of_iterations=3)
+        mesh_clean.compute_vertex_normals()
+
+        mesh_clean, _ = mesh_clean.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
         triangle_clusters, cluster_n_triangles, _ = mesh_clean.cluster_connected_triangles()
         triangle_clusters = np.asarray(triangle_clusters)
         cluster_n_triangles = np.asarray(cluster_n_triangles)
-        
-        # En büyük cluster'ı tut
         if len(cluster_n_triangles) > 0:
             largest_cluster_idx = cluster_n_triangles.argmax()
             triangles_to_remove = triangle_clusters != largest_cluster_idx
             mesh_clean.remove_triangles_by_mask(triangles_to_remove)
-        
+
         mesh_clean.remove_degenerate_triangles()
         mesh_clean.remove_duplicated_triangles()
         mesh_clean.remove_duplicated_vertices()
         mesh_clean.remove_non_manifold_edges()
-        
+        mesh_clean.compute_vertex_normals()
         return mesh_clean
-    
-    def ai_enhance(self, mesh):
-        """AI destekli mesh iyileştirme"""
+
+    def texture_map(self, mesh, merged_pack):
         try:
-            # Trimesh'e dönüştür
-            m = trimesh.Trimesh(
-                vertices=np.asarray(mesh.vertices),
-                faces=np.asarray(mesh.triangles)
+            option = o3d.pipelines.color_map.ColorMapOptimizationOption()
+            option.max_iteration = 300 if self.quality_level == 'Yüksek' else 150
+            o3d.pipelines.color_map.color_map_optimization(
+                mesh,
+                merged_pack.rgbd_frames,
+                merged_pack.poses,
+                self.intrinsic,
+                option
             )
-            
-            # Kalite seviyesine göre işlem
-            if self.quality_level == 'Yüksek':
-                # Subdivision ile detay artır
+            return mesh
+        except Exception as e:
+            self.progress.emit(82, f"Texture mapping hatası: {e}, devam ediliyor.")
+            return mesh
+
+    def ai_complete(self, mesh):
+        if self.ai_model == 'Kapalı':
+            return mesh
+        try:
+            m = trimesh.Trimesh(vertices=np.asarray(mesh.vertices), faces=np.asarray(mesh.triangles))
+            if self.ai_model == 'PCN':
                 m = m.subdivide()
+            elif self.ai_model == 'SnowflakeNet':
+                m = m.smoothed()
+                m = m.subdivide()
+            if self.quality_level == 'Yüksek':
                 target_faces = int(len(m.faces) * 0.9)
             elif self.quality_level == 'Orta':
                 target_faces = int(len(m.faces) * 0.7)
             else:
                 target_faces = int(len(m.faces) * 0.5)
-            
-            # Quadratic decimation
             if len(m.faces) > target_faces:
                 m = m.simplify_quadratic_decimation(target_faces)
-            
-            # Smoothing
-            m = m.smoothed()
-            
-            # Open3D mesh'e geri dönüştür
             mesh_ai = o3d.geometry.TriangleMesh(
                 o3d.utility.Vector3dVector(m.vertices),
                 o3d.utility.Vector3iVector(m.faces)
             )
-            mesh_ai.compute_vertex_normals()
-            
-            # Renkleri koru
             if mesh.has_vertex_colors():
                 mesh_ai.vertex_colors = mesh.vertex_colors
-            
+            mesh_ai.compute_vertex_normals()
             return mesh_ai
-            
         except Exception as e:
-            print(f"[WARN] AI enhance hatası: {e}, orijinal mesh döndürülüyor")
+            self.progress.emit(89, f"AI tamamlama hatası: {e}, orijinal mesh ile devam.")
             return mesh
+
+    def measure_and_log(self, mesh):
+        try:
+            aabb = mesh.get_axis_aligned_bounding_box()
+            min_bound = aabb.get_min_bound()
+            max_bound = aabb.get_max_bound()
+            size = max_bound - min_bound
+            # Volume approx via convex hull (Open3D triangle mesh volume isn't always available)
+            hull = mesh.compute_convex_hull()[0]
+            volume = hull.get_volume()
+            roughness = float(np.std(np.asarray(mesh.vertex_normals)))
+            txt = f"Boyut: {size[0]:.3f}m x {size[1]:.3f}m x {size[2]:.3f}m | Hacim: {volume:.6f} m^3 | Pürüzlülük: {roughness:.4f}"
+            self.progress.emit(93, txt)
+            return txt
+        except Exception:
+            return "Ölçüm hesaplanamadı."
 
 
 class KinectScanner(QWidget):
@@ -207,32 +378,44 @@ class KinectScanner(QWidget):
         super().__init__()
         self.setWindowTitle("Kinect 3D Tarama Sistemi - Pro Edition")
         self.setGeometry(100, 100, 1000, 700)
-        
+
         # Kinect durumu
         self.kinect_connected = False
         self.check_kinect_connection()
-        
+
+        # Webcam hibrit modu
+        self.webcam = None
+
         # Tarama durumu
         self.scanning = False
         self.rgbd_frames = []
         self.last_frame_time = 0
-        self.frame_skip = 5  # Her 5 frame'den 1'ini al
+        self.frame_skip = 5
         self.frame_counter = 0
         self.reconstruction_thread = None
-        
-        # Kamera intrinsic parametreleri
+
+        # Çoklu tarama
+        self.scans = []
+
+        # Kamera intrinsic parametreleri (Kinect v1 default)
         self.intrinsic = o3d.camera.PinholeCameraIntrinsic()
         self.intrinsic.set_intrinsics(640, 480, 525.0, 525.0, 319.5, 239.5)
-        
+
+        # RT preview
+        self.preview_vis = None
+        self.preview_pcd = None
+        self.preview_lock = threading.Lock()
+
         self.init_ui()
-        
-        # Canlı görüntü timer'ı
+
+        # Canlı görüntü timer
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_frame)
         self.timer.start(30)
-    
+
+        self.log("Sistem hazır. Kinect durumu: " + ("BAĞLI ✅" if self.kinect_connected else "BAĞLI DEĞİL ❌"))
+
     def check_kinect_connection(self):
-        """Kinect bağlantısını kontrol et"""
         try:
             rgb, _ = freenect.sync_get_video()
             if rgb is not None:
@@ -244,64 +427,55 @@ class KinectScanner(QWidget):
         except Exception as e:
             self.kinect_connected = False
             print(f"[ERROR] Kinect hatası: {e}")
-    
+
     def init_ui(self):
-        """Gelişmiş UI oluştur"""
         main_layout = QHBoxLayout()
-        
-        # Sol panel - Video ve kontroller
+
+        # Sol panel
         left_panel = QVBoxLayout()
-        
-        # Video label
+
         self.video_label = QLabel("Kinect Görüntüsü")
         self.video_label.setMinimumSize(640, 480)
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setStyleSheet("border: 2px solid #333; background-color: #000;")
         left_panel.addWidget(self.video_label)
-        
-        # Durum bilgisi
+
         self.status_label = QLabel("Hazır" if self.kinect_connected else "⚠️ Kinect Bağlı Değil!")
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setStyleSheet("font-size: 14px; padding: 10px; background-color: #2c3e50; color: white;")
         left_panel.addWidget(self.status_label)
-        
-        # Frame sayacı
+
         self.frame_count_label = QLabel("Toplanan Frame: 0")
         self.frame_count_label.setAlignment(Qt.AlignCenter)
         left_panel.addWidget(self.frame_count_label)
-        
-        # Kontrol butonları
+
         button_layout = QHBoxLayout()
-        
         self.start_btn = QPushButton("🎬 Taramaya Başla")
         self.start_btn.setMinimumHeight(50)
         self.start_btn.setStyleSheet("font-size: 16px; font-weight: bold; background-color: #27ae60; color: white;")
         self.start_btn.clicked.connect(self.start_scan)
         self.start_btn.setEnabled(self.kinect_connected)
-        
+
         self.stop_btn = QPushButton("⏹ Taramayı Bitir")
         self.stop_btn.setMinimumHeight(50)
         self.stop_btn.setStyleSheet("font-size: 16px; font-weight: bold; background-color: #e74c3c; color: white;")
         self.stop_btn.clicked.connect(self.stop_scan)
         self.stop_btn.setEnabled(False)
-        
+
         button_layout.addWidget(self.start_btn)
         button_layout.addWidget(self.stop_btn)
         left_panel.addLayout(button_layout)
-        
-        # Progress bar
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         left_panel.addWidget(self.progress_bar)
-        
-        # Sağ panel - Ayarlar ve log
+
+        # Sağ panel
         right_panel = QVBoxLayout()
-        
-        # Ayarlar grubu
+
         settings_group = QGroupBox("⚙️ Tarama Ayarları")
         settings_layout = QVBoxLayout()
-        
-        # Frame skip ayarı
+
         frame_skip_layout = QHBoxLayout()
         frame_skip_layout.addWidget(QLabel("Frame Aralığı:"))
         self.frame_skip_spin = QSpinBox()
@@ -311,269 +485,537 @@ class KinectScanner(QWidget):
         self.frame_skip_spin.valueChanged.connect(lambda v: setattr(self, 'frame_skip', v))
         frame_skip_layout.addWidget(self.frame_skip_spin)
         settings_layout.addLayout(frame_skip_layout)
-        
-        # Kalite ayarı
+
         quality_layout = QHBoxLayout()
         quality_layout.addWidget(QLabel("Kalite Seviyesi:"))
         self.quality_combo = QComboBox()
-        self.quality_combo.addItems(['Hızlı', 'Orta', 'Yüksek'])
+        self.quality_combo.addItems(['Otomatik', 'Hızlı', 'Orta', 'Yüksek'])
         self.quality_combo.setCurrentText('Orta')
-        self.quality_combo.setToolTip("Yüksek = daha iyi kalite ama yavaş")
+        self.quality_combo.setToolTip("Otomatik donanımına göre seçer")
         quality_layout.addWidget(self.quality_combo)
         settings_layout.addLayout(quality_layout)
-        
-        # ICP refinement
+
         self.icp_checkbox = QCheckBox("ICP Refinement Kullan")
         self.icp_checkbox.setChecked(True)
         self.icp_checkbox.setToolTip("Daha doğru hizalama için (biraz yavaşlatır)")
         settings_layout.addWidget(self.icp_checkbox)
-        
-        # Mesh önizleme
-        self.preview_checkbox = QCheckBox("İşlem Sonrası Önizleme Göster")
-        self.preview_checkbox.setChecked(True)
-        settings_layout.addWidget(self.preview_checkbox)
-        
+
+        self.rt_preview_checkbox = QCheckBox("Gerçek Zamanlı 3D Önizleme")
+        self.rt_preview_checkbox.setChecked(True)
+        self.rt_preview_checkbox.setToolTip("Tarama sırasında nokta bulutu önizlemesi gösterilir")
+        settings_layout.addWidget(self.rt_preview_checkbox)
+
+        self.gpu_checkbox = QCheckBox("GPU Hızlandırma (Deneysel)")
+        self.gpu_checkbox.setChecked(False)
+        self.gpu_checkbox.setToolTip("Open3D Tensor/SLAM varsa kullanır (deneysel)")
+        settings_layout.addWidget(self.gpu_checkbox)
+
+        ai_layout = QHBoxLayout()
+        ai_layout.addWidget(QLabel("AI Tamamlama:"))
+        self.ai_combo = QComboBox()
+        self.ai_combo.addItems(['Kapalı', 'PCN', 'SnowflakeNet'])
+        self.ai_combo.setToolTip("Eksik bölgeler için AI destekli nokta tamamlama (placeholder)")
+        ai_layout.addWidget(self.ai_combo)
+        settings_layout.addLayout(ai_layout)
+
+        self.texture_checkbox = QCheckBox("Gerçek Zamanlı Texture Mapping")
+        self.texture_checkbox.setChecked(True)
+        self.texture_checkbox.setToolTip("TSDF sonrası RGB projeksiyonu ile renk optimizasyonu")
+        settings_layout.addWidget(self.texture_checkbox)
+
+        self.slam_checkbox = QCheckBox("Loop Closure / SLAM")
+        self.slam_checkbox.setChecked(True)
+        self.slam_checkbox.setToolTip("Uzun taramalarda drift düzeltme")
+        settings_layout.addWidget(self.slam_checkbox)
+
+        self.segment_checkbox = QCheckBox("Arka Plan Segmentasyonu")
+        self.segment_checkbox.setChecked(True)
+        self.segment_checkbox.setToolTip("Derinlik ile arka planı maskele")
+        settings_layout.addWidget(self.segment_checkbox)
+
+        self.hybrid_checkbox = QCheckBox("Hibrit Kamera (Webcam RGB)")
+        self.hybrid_checkbox.setChecked(False)
+        self.hybrid_checkbox.setToolTip("Kinect derinlik + webcam renk")
+        settings_layout.addWidget(self.hybrid_checkbox)
+
         settings_group.setLayout(settings_layout)
         right_panel.addWidget(settings_group)
-        
-        # Export grubu
+
+        multi_group = QGroupBox("📷 Multi-Scan Kontrolü")
+        multi_layout = QHBoxLayout()
+        self.new_scan_btn = QPushButton("Yeni Tarama Ekle")
+        self.new_scan_btn.setToolTip("Mevcut taramayı paketleyip yeni taramaya başla")
+        self.new_scan_btn.clicked.connect(self.pack_current_scan)
+        self.new_scan_btn.setEnabled(False)
+        multi_layout.addWidget(self.new_scan_btn)
+
+        self.merge_scans_btn = QPushButton("Taramaları Birleştir ve İşle")
+        self.merge_scans_btn.setToolTip("Eklenmiş taramaları tek modelde birleştir")
+        self.merge_scans_btn.clicked.connect(self.merge_and_reconstruct)
+        self.merge_scans_btn.setEnabled(False)
+        multi_layout.addWidget(self.merge_scans_btn)
+        multi_group.setLayout(multi_layout)
+        right_panel.addWidget(multi_group)
+
         export_group = QGroupBox("💾 Export Ayarları")
         export_layout = QVBoxLayout()
-        
         format_layout = QHBoxLayout()
         format_layout.addWidget(QLabel("Format:"))
         self.format_combo = QComboBox()
-        self.format_combo.addItems(['OBJ', 'STL', 'PLY'])
+        self.format_combo.addItems(['OBJ', 'STL', 'PLY', 'GLB', 'GLTF'])
         format_layout.addWidget(self.format_combo)
         export_layout.addLayout(format_layout)
-        
+
         self.export_btn = QPushButton("📁 Farklı Kaydet")
         self.export_btn.clicked.connect(self.export_mesh)
         self.export_btn.setEnabled(False)
         export_layout.addWidget(self.export_btn)
-        
         export_group.setLayout(export_layout)
         right_panel.addWidget(export_group)
-        
-        # Log alanı
+
         log_group = QGroupBox("📋 İşlem Günlüğü")
         log_layout = QVBoxLayout()
-        
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(200)
         self.log_text.setStyleSheet("background-color: #1e1e1e; color: #00ff00; font-family: monospace;")
         log_layout.addWidget(self.log_text)
-        
         log_group.setLayout(log_layout)
         right_panel.addWidget(log_group)
-        
+
         right_panel.addStretch()
-        
-        # Ana layout'a ekle
+
         main_layout.addLayout(left_panel, 2)
         main_layout.addLayout(right_panel, 1)
-        
         self.setLayout(main_layout)
-        
-        self.log("Sistem hazır. Kinect durumu: " + ("BAĞLI ✅" if self.kinect_connected else "BAĞLI DEĞİL ❌"))
-    
+
     def log(self, message):
-        """Log mesajı ekle"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_text.append(f"[{timestamp}] {message}")
-    
+
+    def init_preview(self):
+        if self.preview_vis is not None:
+            return
+        self.preview_vis = o3d.visualization.Visualizer()
+        self.preview_vis.create_window(window_name="RT Nokta Bulutu Önizleme", width=640, height=480, visible=True)
+        self.preview_pcd = o3d.geometry.PointCloud()
+        self.preview_vis.add_geometry(self.preview_pcd)
+
+    def update_preview(self, rgbd):
+        if not self.rt_preview_checkbox.isChecked():
+            return
+        if self.preview_vis is None:
+            self.init_preview()
+        with self.preview_lock:
+            pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, self.intrinsic)
+            # Flip for visualization consistency
+            pcd.transform([[1, 0, 0, 0],
+                           [0, -1, 0, 0],
+                           [0, 0, -1, 0],
+                           [0, 0, 0, 1]])
+            self.preview_pcd += pcd.voxel_down_sample(voxel_size=0.01)
+            self.preview_pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+            self.preview_pcd.estimate_normals()
+            self.preview_vis.update_geometry(self.preview_pcd)
+            self.preview_vis.poll_events()
+            self.preview_vis.update_renderer()
+
+    def apply_segment(self, depth):
+        """Basit arka plan segmentasyonu: uzakları maskele."""
+        if not self.segment_checkbox.isChecked():
+            return depth
+        d = depth.copy()
+        d = d.astype(np.uint16)
+        d[d == 0] = 0
+        d[d > 3500] = 0  # 3.5m üstünü kes
+        return d
+
+    def get_rgb_frame(self):
+        """Kinect RGB veya hibrit webcam RGB."""
+        rgb, _ = freenect.sync_get_video()
+        if rgb is None:
+            return None
+        rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        if self.hybrid_checkbox.isChecked():
+            if self.webcam is None:
+                self.webcam = cv2.VideoCapture(0)
+            ret, wrgb = self.webcam.read()
+            if ret and wrgb is not None:
+                wrgb = cv2.resize(wrgb, (rgb.shape[1], rgb.shape[0]))
+                return wrgb
+        return rgb
+
     def update_frame(self):
-        """Canlı görüntü güncelleme"""
         try:
-            rgb, _ = freenect.sync_get_video()
-            
+            rgb = self.get_rgb_frame()
             if rgb is None:
                 if self.kinect_connected:
                     self.kinect_connected = False
                     self.status_label.setText("⚠️ Kinect Bağlantısı Kesildi!")
                     self.log("HATA: Kinect bağlantısı kesildi")
                 return
-            
-            # Bağlantı yeniden kurulduysa
+
             if not self.kinect_connected:
                 self.kinect_connected = True
                 self.status_label.setText("Hazır")
                 self.log("Kinect bağlantısı yeniden kuruldu")
                 self.start_btn.setEnabled(True)
-            
-            rgb = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
-            
+
             # Tarama sırasında frame kaydet
             if self.scanning:
                 self.frame_counter += 1
-                
                 if self.frame_counter % self.frame_skip == 0:
                     depth, _ = freenect.sync_get_depth()
-                    
                     if depth is not None:
-                        # Depth filtreleme (0 ve çok uzak değerleri temizle)
-                        depth = depth.astype(np.uint16)
-                        depth[depth == 0] = 0
-                        depth[depth > 4500] = 0  # 4.5m'den uzakları kes
-                        
+                        depth = self.apply_segment(depth)
+                        depth[depth > 4500] = 0  # güvenlik clamp
                         rgb_o3d = o3d.geometry.Image(cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB))
-                        depth_o3d = o3d.geometry.Image(depth)
-                        
+                        depth_o3d = o3d.geometry.Image(depth.astype(np.uint16))
+
                         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-                            rgb_o3d, depth_o3d, 
+                            rgb_o3d, depth_o3d,
                             depth_scale=1000.0,
                             depth_trunc=4.5,
                             convert_rgb_to_intensity=False
                         )
-                        
                         self.rgbd_frames.append(rgbd)
                         self.frame_count_label.setText(f"Toplanan Frame: {len(self.rgbd_frames)}")
-                        
-                        # Yeşil çerçeve ekle (tarama aktif göstergesi)
+
+                        # Yeşil çerçeve
                         cv2.rectangle(rgb, (0, 0), (639, 479), (0, 255, 0), 5)
-            
+
+                        # RT preview
+                        self.update_preview(rgbd)
+
             # PyQt görüntüsüne dönüştür
             h, w, ch = rgb.shape
             bytes_per_line = ch * w
             qt_img = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_BGR888)
-            
             self.video_label.setPixmap(
                 QPixmap.fromImage(qt_img).scaled(
-                    self.video_label.width(), 
-                    self.video_label.height(), 
+                    self.video_label.width(),
+                    self.video_label.height(),
                     Qt.KeepAspectRatio
                 )
             )
-            
+
         except Exception as e:
             self.log(f"Frame güncelleme hatası: {str(e)}")
-    
+
     def start_scan(self):
-        """Taramayı başlat"""
         if not self.kinect_connected:
             QMessageBox.warning(self, "Bağlantı Hatası", "Kinect bağlı değil!")
             return
-        
+
         self.scanning = True
         self.rgbd_frames = []
         self.frame_counter = 0
-        
+
+        # Otomatik kalite modu
+        if self.quality_combo.currentText() == 'Otomatik':
+            self.quality_combo.setCurrentText(self.auto_quality())
+
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.status_label.setText("🔴 TARAMA AKTIF")
         self.status_label.setStyleSheet("font-size: 14px; padding: 10px; background-color: #c0392b; color: white;")
-        
+        self.new_scan_btn.setEnabled(True)
+
         self.log("Tarama başladı! Nesneyi yavaşça döndürün...")
-    
+
     def stop_scan(self):
-        """Taramayı durdur ve reconstruction başlat"""
         self.scanning = False
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        
+
+        # Preview kapat
+        if self.preview_vis is not None:
+            try:
+                self.preview_vis.destroy_window()
+            except Exception:
+                pass
+            self.preview_vis = None
+            self.preview_pcd = None
+
         if len(self.rgbd_frames) < 5:
-            QMessageBox.warning(self, "Yetersiz Veri", 
-                f"En az 5 frame gerekli! Toplanan: {len(self.rgbd_frames)}")
+            QMessageBox.warning(self, "Yetersiz Veri",
+                                f"En az 5 frame gerekli! Toplanan: {len(self.rgbd_frames)}")
             self.status_label.setText("Hazır")
             return
-        
+
         self.log(f"Tarama tamamlandı. {len(self.rgbd_frames)} frame toplandı.")
         self.status_label.setText("⚙️ İŞLENİYOR...")
         self.status_label.setStyleSheet("font-size: 14px; padding: 10px; background-color: #f39c12; color: white;")
-        
-        # Reconstruction thread'i başlat
+
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
-        
+
+        # Çoklu tarama varsa birleştirme girişi hazırla
+        if len(self.scans) >= 1:
+            self.log("Tek paket veya birleştirilmemiş tarama işleniyor...")
+            rgbd_data = self.rgbd_frames.copy()
+            scans_input = self.scans.copy() + ([rgbd_data] if rgbd_data else [])
+        else:
+            scans_input = [self.rgbd_frames.copy()]
+
         self.reconstruction_thread = ReconstructionThread(
-            self.rgbd_frames.copy(),
+            scans_input,
             self.intrinsic,
             self.quality_combo.currentText(),
-            self.icp_checkbox.isChecked()
+            self.icp_checkbox.isChecked(),
+            use_gpu=self.gpu_checkbox.isChecked(),
+            use_texture=self.texture_checkbox.isChecked(),
+            ai_model=self.ai_combo.currentText(),
+            enable_slam=self.slam_checkbox.isChecked()
         )
-        
         self.reconstruction_thread.progress.connect(self.update_progress)
         self.reconstruction_thread.finished.connect(self.reconstruction_finished)
         self.reconstruction_thread.start()
-    
+
     def update_progress(self, value, message):
-        """Progress güncelleme"""
         self.progress_bar.setValue(value)
         self.log(message)
-    
+
     def reconstruction_finished(self, mesh, success):
-        """Reconstruction tamamlandı"""
         self.progress_bar.setVisible(False)
-        
+
         if not success or mesh is None:
             QMessageBox.critical(self, "Hata", "Mesh oluşturulamadı!")
             self.status_label.setText("❌ HATA")
             self.status_label.setStyleSheet("font-size: 14px; padding: 10px; background-color: #e74c3c; color: white;")
             return
-        
+
         self.current_mesh = mesh
-        
+
         # Otomatik kaydet
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"scan_{timestamp}.obj"
         filepath = os.path.join(BASE_DIR, filename)
-        
+
         try:
             o3d.io.write_triangle_mesh(filepath, mesh)
             self.log(f"✅ Mesh kaydedildi: {filename}")
             self.log(f"   Vertices: {len(mesh.vertices)}, Faces: {len(mesh.triangles)}")
-            
+
             self.status_label.setText("✅ TAMAMLANDI")
             self.status_label.setStyleSheet("font-size: 14px; padding: 10px; background-color: #27ae60; color: white;")
-            
+
             self.export_btn.setEnabled(True)
-            
-            # Önizleme göster
-            if self.preview_checkbox.isChecked():
+
+            # Önizleme
+            if True:
                 self.log("Mesh önizlemesi açılıyor...")
                 o3d.visualization.draw_geometries([mesh], window_name="3D Mesh Önizleme")
-            
-            QMessageBox.information(self, "Başarılı", 
-                f"3D model başarıyla oluşturuldu!\n\nDosya: {filename}\nKonum: {BASE_DIR}")
-            
+
+            QMessageBox.information(self, "Başarılı",
+                                    f"3D model başarıyla oluşturuldu!\n\nDosya: {filename}\nKonum: {BASE_DIR}")
+
         except Exception as e:
             self.log(f"❌ Kaydetme hatası: {str(e)}")
             QMessageBox.critical(self, "Kayıt Hatası", f"Mesh kaydedilemedi:\n{str(e)}")
-    
+
+        # Multi-scan state reset
+        self.scans = []
+        self.merge_scans_btn.setEnabled(False)
+        self.new_scan_btn.setEnabled(False)
+
     def export_mesh(self):
-        """Mesh'i farklı formatta kaydet"""
         if not hasattr(self, 'current_mesh'):
             return
-        
+
         format_ext = self.format_combo.currentText().lower()
-        
         filename, _ = QFileDialog.getSaveFileName(
-            self, "Mesh Kaydet", 
+            self, "Mesh Kaydet",
             os.path.join(BASE_DIR, f"scan.{format_ext}"),
             f"{format_ext.upper()} Files (*.{format_ext})"
         )
-        
+
         if filename:
             try:
                 o3d.io.write_triangle_mesh(filename, self.current_mesh)
                 self.log(f"✅ Export başarılı: {os.path.basename(filename)}")
                 QMessageBox.information(self, "Başarılı", f"Mesh kaydedildi:\n{filename}")
+
+                # Web viewer aç (GLTF/GLB ise)
+                if format_ext in ('glb', 'gltf'):
+                    self.launch_web_viewer(filename)
+
             except Exception as e:
                 self.log(f"❌ Export hatası: {str(e)}")
                 QMessageBox.critical(self, "Hata", f"Export başarısız:\n{str(e)}")
 
+    def launch_web_viewer(self, model_path):
+        """Basit bir HTML viewer ile üç boyutlu model görüntüleme."""
+        html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>Model Viewer</title>
+<style>body,html{{margin:0;height:100%;background:#111}} canvas{{display:block}}</style>
+</head>
+<body>
+<script src="https://unpkg.com/three@0.159.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.159.0/examples/js/loaders/GLTFLoader.js"></script>
+<script src="https://unpkg.com/three@0.159.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111111);
+const camera = new THREE.PerspectiveCamera(60, window.innerWidth/window.innerHeight, 0.01, 100);
+camera.position.set(0.5, 0.5, 1.2);
+const renderer = new THREE.WebGLRenderer({{antialias:true}});
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+const light = new THREE.HemisphereLight(0xffffff, 0x444444, 1.0);
+scene.add(light);
+const loader = new THREE.GLTFLoader();
+loader.load("{model_path.replace('\\', '/')}", gltf => {{
+    const m = gltf.scene;
+    scene.add(m);
+}}, undefined, err => console.error(err));
+window.addEventListener('resize', () => {{
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+}});
+function animate(){{
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+}}
+animate();
+</script>
+</body>
+</html>
+"""
+        html_path = os.path.join(BASE_DIR, "viewer.html")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        os.startfile(html_path) if os.name == 'nt' else os.system(f"open '{html_path}'" if sys.platform == 'darwin' else f"xdg-open '{html_path}'")
 
-def main():
+    def pack_current_scan(self):
+        if not self.rgbd_frames:
+            QMessageBox.warning(self, "Boş Tarama", "Paketlenecek veri yok.")
+            return
+        self.scans.append(self.rgbd_frames.copy())
+        self.log(f"Tarama paketi eklendi. Toplam paket: {len(self.scans)}")
+        self.rgbd_frames = []
+        self.frame_count_label.setText("Toplanan Frame: 0")
+        self.merge_scans_btn.setEnabled(len(self.scans) >= 2)
+
+    def merge_and_reconstruct(self):
+        if len(self.scans) < 2:
+            QMessageBox.warning(self, "Yetersiz Paket", "En az iki tarama paketi gerekli.")
+            return
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.reconstruction_thread = ReconstructionThread(
+            self.scans.copy(),
+            self.intrinsic,
+            self.quality_combo.currentText(),
+            self.icp_checkbox.isChecked(),
+            use_gpu=self.gpu_checkbox.isChecked(),
+            use_texture=self.texture_checkbox.isChecked(),
+            ai_model=self.ai_combo.currentText(),
+            enable_slam=self.slam_checkbox.isChecked()
+        )
+        self.reconstruction_thread.progress.connect(self.update_progress)
+        self.reconstruction_thread.finished.connect(self.reconstruction_finished)
+        self.reconstruction_thread.start()
+
+    def auto_quality(self):
+        if not PSUTIL_AVAILABLE:
+            return 'Orta'
+        ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+        cpu_count = psutil.cpu_count(logical=True)
+        # Basit heuristik
+        if ram_gb >= 16 and cpu_count >= 8:
+            return 'Yüksek'
+        elif ram_gb >= 8 and cpu_count >= 4:
+            return 'Orta'
+        else:
+            return 'Hızlı'
+
+
+def run_gui():
     app = QApplication(sys.argv)
-    
-    # Uygulama stili
     app.setStyle('Fusion')
-    
     scanner = KinectScanner()
     scanner.show()
-    
     sys.exit(app.exec_())
+
+
+def run_batch(args):
+    """
+    Basit batch mode: input dizin(leri) altında color_*.png ve depth_*.png çiftlerinden RGBD oluşturup reconstruct eder.
+    Kullanım:
+      --inputs /path/scan1 /path/scan2 ...
+      --quality Orta --gpu --texture --ai PCN --slam
+    """
+    intrinsic = o3d.camera.PinholeCameraIntrinsic()
+    intrinsic.set_intrinsics(640, 480, 525.0, 525.0, 319.5, 239.5)
+
+    def load_scan_dir(d):
+        color_paths = sorted(Path(d).glob("color_*.png"))
+        depth_paths = sorted(Path(d).glob("depth_*.png"))
+        frames = []
+        for cp, dp in zip(color_paths, depth_paths):
+            color = cv2.cvtColor(cv2.imread(str(cp)), cv2.COLOR_BGR2RGB)
+            depth = cv2.imread(str(dp), cv2.IMREAD_UNCHANGED)
+            rgb_o3d = o3d.geometry.Image(color)
+            depth_o3d = o3d.geometry.Image(depth.astype(np.uint16))
+            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                rgb_o3d, depth_o3d,
+                depth_scale=1000.0, depth_trunc=4.5,
+                convert_rgb_to_intensity=False
+            )
+            frames.append(rgbd)
+        return frames
+
+    scans = []
+    for d in args.inputs:
+        scans.append(load_scan_dir(d))
+
+    def on_finish(mesh, ok):
+        if not ok or mesh is None:
+            print("Batch: Reconstruction failed.")
+            return
+        out = args.output if args.output else os.path.join(BASE_DIR, f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.ply")
+        o3d.io.write_triangle_mesh(out, mesh)
+        print(f"Batch: Saved mesh -> {out}")
+
+    # Threadless run by reusing class logic
+    rt = ReconstructionThread(scans, intrinsic, args.quality, use_icp=True,
+                              use_gpu=args.gpu, use_texture=args.texture,
+                              ai_model=args.ai, enable_slam=args.slam)
+    # Bridge progress to console
+    rt.progress.connect(lambda v, m: print(f"[{v}%] {m}"))
+    rt.finished.connect(on_finish)
+    rt.start()
+    rt.wait()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Kinect 3D Tarama Sistemi - Pro Edition")
+    parser.add_argument("--nogui", action="store_true", help="GUI olmadan batch mode çalıştır")
+    parser.add_argument("--inputs", nargs="*", help="Batch mode için giriş dizinleri (color_*.png, depth_*.png)")
+    parser.add_argument("--quality", default="Orta", choices=["Hızlı", "Orta", "Yüksek"], help="Reconstruction kalite seviyesi")
+    parser.add_argument("--gpu", action="store_true", help="GPU hızlandırma (deneysel)")
+    parser.add_argument("--texture", action="store_true", help="Texture mapping aktif")
+    parser.add_argument("--ai", default="Kapalı", choices=["Kapalı", "PCN", "SnowflakeNet"], help="AI tamamlama modu")
+    parser.add_argument("--slam", action="store_true", help="Loop closure / SLAM aktif")
+    parser.add_argument("--output", help="Çıkış mesh dosyası yolu")
+    args, unknown = parser.parse_known_args()
+
+    if args.nogui:
+        if not args.inputs:
+            print("Batch mode için --inputs dizinleri gereklidir.")
+            sys.exit(1)
+        run_batch(args)
+    else:
+        run_gui()
 
 
 if __name__ == "__main__":
